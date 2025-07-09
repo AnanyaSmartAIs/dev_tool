@@ -37,7 +37,7 @@
    
    streamlit run SDAnalyserApp.py
    
-3.Use the interface:
+3. Use the interface:
 
 - Select a tester/device
 - Choose one or more ZIPs
