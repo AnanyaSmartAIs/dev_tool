@@ -39,8 +39,8 @@
    
 3.Use the interface:
 
--Select a tester/device
--Choose one or more ZIPs
--Enter desired frame IDs (e.g., 240,1072)
--Click "Process Selected Walks"
--View or download the results
+- Select a tester/device
+- Choose one or more ZIPs
+- Enter desired frame IDs (e.g., 240,1072)
+- Click "Process Selected Walks"
+- View or download the results
