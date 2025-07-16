@@ -5,13 +5,14 @@ import zipfile
 import tempfile
 import pandas as pd
 import cv2
+from PIL import Image
 
-# Configuration
-BUCKET_NAME = 'smartais-user-walks'
-FRAME_IDS = [240, 1072]  # Default frame IDs
-
+# AWS S3 config
+BUCKET_NAME = 'smartais'
 s3 = boto3.client('s3')
 
+
+# ---- Utilities ----
 
 def list_devices():
     result = s3.list_objects_v2(Bucket=BUCKET_NAME, Delimiter='/')
@@ -30,63 +31,105 @@ def download_and_extract(zip_key):
 
     with zipfile.ZipFile(local_zip, 'r') as zip_ref:
         zip_ref.extractall(tmpdir)
-    
+
     return tmpdir
 
 
-def get_frame_timestamp(video_path, frame_id):
+def extract_frame_image(video_path, frame_id):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None
-    fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if frame_id >= total_frames:
         return None
-    return round(frame_id / fps, 3)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+    success, frame = cap.read()
+    cap.release()
+    if success:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(frame_rgb)
+    return None
 
 
-def process_videos(folder_path, tester, walk_name, frame_ids):
-    results = []
+def find_csv_and_video(folder_path):
+    csv_path = None
+    video_path = None
     for root, _, files in os.walk(folder_path):
-        for file in files:
-            if file.lower().endswith(('.mp4', '.mov', '.avi')):
-                video_path = os.path.join(root, file)
-                for frame_id in frame_ids:
-                    ts = get_frame_timestamp(video_path, frame_id)
-                    if ts is not None:
-                        results.append([tester, walk_name, file, frame_id, ts])
-    return results
+        for f in files:
+            if f == "sceneDescriptionHistory.csv":
+                csv_path = os.path.join(root, f)
+            if f.lower().endswith(('.mp4', '.mov', '.avi')):
+                video_path = os.path.join(root, f)
+        if csv_path and video_path:
+            break
+    return csv_path, video_path
 
 
-# Streamlit UI
-st.title("🎬 Frame Timestamp Extractor")
+def parse_qna_from_csv(csv_path, video_path):
+    df = pd.read_csv(csv_path)
+    df = df[df['Question Asked'].notna() & df['AI Reply'].notna() & df['FrameID'].notna()]
+    df = df.astype({'FrameID': 'int'})
+
+    entries = []
+    for _, row in df.iterrows():
+        frame_id = row['FrameID']
+        timestamp = row['TimeStamp']
+        question = row['Question Asked']
+        answer = row['AI Reply']
+        image = extract_frame_image(video_path, frame_id)
+        entries.append({
+            "timestamp": timestamp,
+            "frame_id": frame_id,
+            "question": question,
+            "answer": answer,
+            "image": image
+        })
+    return entries
+
+
+# ---- Streamlit UI ----
+
+st.title("Smartais SD Q&A + Frame Image Verifier")
 
 devices = list_devices()
 selected_device = st.selectbox("Select Tester/Device", devices)
 
 if selected_device:
-    zips = list_zips(selected_device)
-    selected_zips = st.multiselect("Select Walk ZIP(s)", zips)
+    zip_keys = list_zips(selected_device)
 
-    frame_input = st.text_input("Enter frame IDs (comma-separated)", value="240,1072")
-    frame_ids = [int(f.strip()) for f in frame_input.split(',') if f.strip().isdigit()]
+    st.info("📦 Scanning for valid walks containing sceneDescriptionHistory.csv...")
 
-    if st.button("Process Selected Walks"):
-        all_results = []
-        for zip_key in selected_zips:
-            walk_name = os.path.basename(zip_key).replace('.zip', '')
-            st.write(f"🔄 Processing: `{walk_name}`")
+    # Scan all zips to find valid ones with sceneDescriptionHistory.csv
+    valid_walk_map = {}
+    for zip_key in zip_keys:
+        try:
+            tmpdir = download_and_extract(zip_key)
+            csv_path, video_path = find_csv_and_video(tmpdir)
+            if csv_path and video_path:
+                walk_name = os.path.basename(zip_key).replace(".zip", "")
+                valid_walk_map[walk_name] = (zip_key, tmpdir, csv_path, video_path)
+        except Exception:
+            continue
 
-            extracted_path = download_and_extract(zip_key)
-            results = process_videos(extracted_path, selected_device, walk_name, frame_ids)
-            all_results.extend(results)
+    if not valid_walk_map:
+        st.warning("⚠️ No valid walks with sceneDescriptionHistory.csv found.")
+    else:
+        selected_walk = st.selectbox("📁 Select a Walk to Review", list(valid_walk_map.keys()))
 
-        if all_results:
-            df = pd.DataFrame(all_results, columns=["tester", "walk", "video", "frame_id", "timestamp"])
-            st.success("✅ Processing complete!")
-            st.dataframe(df)
+        if selected_walk:
+            zip_key, folder_path, csv_path, video_path = valid_walk_map[selected_walk]
+            st.subheader(f"🔍 Reviewing Walk: `{selected_walk}`")
 
-            csv = df.to_csv(sep='\t', index=False).encode('utf-8')
-            st.download_button("💾 Download Results CSV", csv, "Results.csv", "text/csv")
-        else:
-            st.warning("⚠️ No valid videos or frames found in selected ZIPs.")
+            qna_entries = parse_qna_from_csv(csv_path, video_path)
+            if not qna_entries:
+                st.info("No valid Q&A entries found.")
+            else:
+                for entry in qna_entries:
+                    st.markdown(f"🕒 **{entry['timestamp']}**")
+                    st.markdown(f"❓ **Q:** {entry['question']}")
+                    st.markdown(f"💬 **A:** {entry['answer']}")
+                    if entry['image']:
+                        st.image(entry['image'], caption=f"🖼️ Frame {entry['frame_id']}", use_column_width=True)
+                    else:
+                        st.warning(f"⚠️ Could not extract image for frame {entry['frame_id']}")
+
